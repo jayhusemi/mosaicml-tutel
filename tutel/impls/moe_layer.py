@@ -79,6 +79,8 @@ class MOELayer(torch.nn.Module):
         is_gshard_loss=True,
         parallel_type='auto',
         use_2dh=False,
+        device=None,
+        dtype=None,
         **kwargs
     ):
         super().__init__()
@@ -156,7 +158,7 @@ class MOELayer(torch.nn.Module):
 
             self.experts = fused_experts.ExpertModule(**experts)
 
-        self.experts.update(self)
+        self.experts.update(self, device=device, dtype=dtype)
 
         if scan_expert_func is not None:
             for n, p in self.experts.named_parameters():
@@ -200,10 +202,10 @@ class MOELayer(torch.nn.Module):
             torch.manual_seed(seeds[2])
 
     def extra_repr(self):
-        return 'Top-K(s) = %s, Total-Experts = %d [managed by %d device(s)],' % (
-            [f'k={x.top_k}, noise={x.gate_noise}' for x in self.gates],
-            self.num_global_experts,
-            self.world_size,
+        return (
+            f"Top-K(s) = {[f'k={gate.top_k}, noise={gate.gate_noise}' for gate in self.gates]}, "
+            f'Total-Experts = {self.num_global_experts} '
+            f'[managed by {self.world_size} device(s)],'
         )
 
     def get_parameter_iterator(self, param_type):
@@ -225,13 +227,24 @@ class MOELayer(torch.nn.Module):
             result_output.l_aux = None
             return self.result_func(result_output) if self.result_func is not None else result_output
 
+        if torch.is_autocast_enabled():
+            # casts inputs to autocast dtype which enables all2all to be done in low precision
+            if input.device.type == 'cuda':
+                dtype = torch.get_autocast_gpu_dtype()
+            elif input.device.type == 'cpu':
+                dtype = torch.get_autocast_cpu_dtype()
+            elif input.device.type == 'xpu':
+                dtype = torch.xpu.get_autocast_xpu_dtype()  # type: ignore[attr-defined]
+            elif input.device.type == 'hpu':
+                dtype = torch.hpu.get_autocast_hpu_dtype()  # type: ignore[attr-defined]
+            else:
+                raise RuntimeError('User specified autocast device_type must be \'cuda\' or \'cpu\'')
+            input = input.to(dtype=dtype)
+
         original_shape, original_dtype  = input.shape, input.dtype
         assert len(original_shape) >= 2, "Input data must be at least 2D tensor: (s)amples, .., (m)odel_dim"
 
         x = input.reshape(-1, original_shape[-reserve_dims:].numel())
-        for p in self.experts.parameters():
-            x = x.to(p.dtype)
-            break
         gctx = self.gates[gate_index]
         a2a_ffn_overlap_degree = a2a_ffn_overlap_degree if a2a_ffn_overlap_degree is not None else self.a2a_ffn_overlap_degree
 
@@ -261,11 +274,7 @@ class MOELayer(torch.nn.Module):
                 inequivalent_tokens = inequivalent_tokens,
             )
 
-
-        if x.is_cuda:
-            with torch.cuda.amp.autocast(enabled=False):
-                logits_dtype, (crit, l_aux) = routing()
-        else:
+        with torch.autocast(device_type=x.device.type, enabled=False):
             logits_dtype, (crit, l_aux) = routing()
 
         y = fast_encode(x.to(logits_dtype), crit, self.is_postscore).to(x.dtype)
@@ -302,5 +311,6 @@ class MOELayer(torch.nn.Module):
         y = y.view(list(original_shape[:-reserve_dims]) + list(self.protected_shape[-reserve_dims:])).to(original_dtype)
         self.l_aux = y.l_aux = l_aux
         return self.result_func(y) if self.result_func is not None else y
+
 
 moe_layer = MOELayer
