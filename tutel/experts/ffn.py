@@ -8,7 +8,7 @@ from torch.nn import init
 from .. import net
 
 class FusedExpertsNetwork(torch.nn.Module):
-    def __init__(self, hidden_size_per_expert, activation_fn=None, activation_fn_with_self=None, output_dim=None):
+    def __init__(self, hidden_size_per_expert, activation_fn=None, activation_fn_with_self=None, output_dim=None, bias=True):
         super().__init__()
         self.skip_expert = (int(torch.os.environ.get('SKIP_EXPERT', '0')) != 0)
         self.hidden_size_per_expert = hidden_size_per_expert
@@ -21,7 +21,11 @@ class FusedExpertsNetwork(torch.nn.Module):
             activation_fn = lambda x: F.relu(x)
         self.activation_fn = activation_fn
 
+        self.has_bias = bias
+
     def update(self, ctx, dtype=None, device=None):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+
         self.sharded_count = ctx.sharded_count
         if ctx.sharded_count > 1:
             assert self.hidden_size_per_expert % ctx.sharded_count == 0, f"Can't evenly divide hidden_size_per_expert ({self.hidden_size_per_expert}) to {ctx.sharded_count} slices."
@@ -31,15 +35,15 @@ class FusedExpertsNetwork(torch.nn.Module):
         local_experts = ctx.num_local_experts
         self.output_dim = self.output_dim or model_dim
 
-        fc1_weight = torch.empty(local_experts, hidden_size, model_dim, dtype=dtype, device=device)
-        fc2_weight = torch.empty(local_experts, hidden_size, self.output_dim, dtype=dtype, device=device)
-        fc1_bias = torch.empty(local_experts, hidden_size, dtype=dtype, device=device)
-        fc2_bias = torch.empty(local_experts, (self.output_dim + ctx.sharded_count - 1) // ctx.sharded_count, dtype=dtype, device=device)
-
-        self.batched_fc1_w = torch.nn.Parameter(fc1_weight)
-        self.batched_fc2_w = torch.nn.Parameter(fc2_weight)
-        self.batched_fc1_bias = torch.nn.Parameter(fc1_bias)
-        self.batched_fc2_bias = torch.nn.Parameter(fc2_bias)
+        self.batched_fc1_w = torch.nn.Parameter(torch.empty(local_experts, hidden_size, model_dim, **factory_kwargs))
+        self.batched_fc2_w = torch.nn.Parameter(torch.empty(local_experts, hidden_size, self.output_dim, **factory_kwargs))
+        
+        if self.has_bias:
+            self.batched_fc1_bias = torch.nn.Parameter(torch.empty(local_experts, hidden_size, **factory_kwargs))
+            self.batched_fc2_bias = torch.nn.Parameter(torch.empty(local_experts, (self.output_dim + ctx.sharded_count - 1) // ctx.sharded_count, **factory_kwargs))
+        else:
+            self.register_parameter('batched_fc1_bias', None)
+            self.register_parameter('batched_fc2_bias', None)
 
         self.reset_parameters()
 
@@ -88,8 +92,10 @@ class FusedExpertsNetwork(torch.nn.Module):
 
         batched_fc1_w = self.batched_fc1_w
         batched_fc2_w = self.batched_fc2_w
-        batched_fc1_bias = self.batched_fc1_bias.unsqueeze(1)
-        batched_fc2_bias = self.batched_fc2_bias.unsqueeze(1)
+        if self.batched_fc1_bias is not None:
+            batched_fc1_bias = self.batched_fc1_bias.unsqueeze(1)
+        if self.batched_fc2_bias is not None:
+            batched_fc2_bias = self.batched_fc2_bias.unsqueeze(1)
 
         # Note: since parameters are in full precision,
         # the zero_gathers are done in full precision
@@ -97,8 +103,10 @@ class FusedExpertsNetwork(torch.nn.Module):
         if ctx.force_data_parallel:
             batched_fc1_w = net.zero_gather(batched_fc1_w, group=ctx.group).view(ctx.num_global_experts, -1, batched_fc1_w.size(2))
             batched_fc2_w = net.zero_gather(batched_fc2_w, group=ctx.group).view(ctx.num_global_experts, -1, batched_fc2_w.size(2))
-            batched_fc1_bias = net.zero_gather(batched_fc1_bias, group=ctx.group).view(ctx.num_global_experts, 1, -1)
-            batched_fc2_bias = net.zero_gather(batched_fc2_bias, group=ctx.group).view(ctx.num_global_experts, 1, -1)
+            if self.batched_fc1_bias is not None:
+                batched_fc1_bias = net.zero_gather(batched_fc1_bias, group=ctx.group).view(ctx.num_global_experts, 1, -1)
+            if self.batched_fc2_bias is not None:
+                batched_fc2_bias = net.zero_gather(batched_fc2_bias, group=ctx.group).view(ctx.num_global_experts, 1, -1)
         elif ctx.force_adaptive:
             if ctx.sharded_count > 1:
                 group_size = ctx.sharded_count // ctx.adaptive_degree
@@ -106,34 +114,42 @@ class FusedExpertsNetwork(torch.nn.Module):
                     ffn_zero_group = net.create_groups_from_world(group_count=-group_size).model_group
                     batched_fc1_w = net.zero_gather(batched_fc1_w, group=ffn_zero_group).view(1, -1, ctx.model_dim)
                     batched_fc2_w = net.zero_gather(batched_fc2_w, group=ffn_zero_group).view(1, -1, self.output_dim)
-                    batched_fc1_bias = net.zero_gather(batched_fc1_bias, group=ffn_zero_group).view(1, 1, -1)
+                    if self.batched_fc1_bias is not None:
+                        batched_fc1_bias = net.zero_gather(batched_fc1_bias, group=ffn_zero_group).view(1, 1, -1)
 
                 ffn_zero_group2 = net.create_groups_from_world(group_count=ctx.num_global_experts).model_group
-                batched_fc2_bias = net.zero_gather(batched_fc2_bias, group=ffn_zero_group2)
-                batched_fc2_bias = batched_fc2_bias.view(1, 1, -1)
+                if self.batched_fc2_bias is not None:
+                    batched_fc2_bias = net.zero_gather(batched_fc2_bias, group=ffn_zero_group2)
+                    batched_fc2_bias = batched_fc2_bias.view(1, 1, -1)
 
-                if ctx.adaptive_degree > 1:
-                    batched_fc2_bias = torch.mul(batched_fc2_bias, 1.0 / ctx.adaptive_degree)
+                    if ctx.adaptive_degree > 1:
+                        batched_fc2_bias = torch.mul(batched_fc2_bias, 1.0 / ctx.adaptive_degree)
         else:
             if ctx.sharded_count > 1:
                 ffn_zero_group = net.create_groups_from_world(group_count=ctx.num_global_experts).model_group
                 if not ctx.use_model_parallel:
                     batched_fc1_w = net.zero_gather(batched_fc1_w, group=ffn_zero_group).view(1, -1, ctx.model_dim)
                     batched_fc2_w = net.zero_gather(batched_fc2_w, group=ffn_zero_group).view(1, -1, self.output_dim)
-                    batched_fc1_bias = net.zero_gather(batched_fc1_bias, group=ffn_zero_group).view(1, 1, -1)
+                    if self.batched_fc1_bias is not None:
+                        batched_fc1_bias = net.zero_gather(batched_fc1_bias, group=ffn_zero_group).view(1, 1, -1)
 
-                batched_fc2_bias = net.zero_gather(batched_fc2_bias, group=ffn_zero_group)
-                batched_fc2_bias = batched_fc2_bias.view(self.batched_fc2_bias.size(0), 1, -1)
+                if self.batched_fc2_bias is not None:
+                    batched_fc2_bias = net.zero_gather(batched_fc2_bias, group=ffn_zero_group)
+                    batched_fc2_bias = batched_fc2_bias.view(self.batched_fc2_bias.size(0), 1, -1)
 
-                if ctx.use_model_parallel:
-                    batched_fc2_bias = torch.mul(batched_fc2_bias, 1.0 / ctx.sharded_count)
+                    if ctx.use_model_parallel:
+                        batched_fc2_bias = torch.mul(batched_fc2_bias, 1.0 / ctx.sharded_count)
 
-        if batched_fc2_bias.size(-1) != self.output_dim:
+        if self.batched_fc2_bias is not None and batched_fc2_bias.size(-1) != self.output_dim:
             batched_fc2_bias = batched_fc2_bias[:, :, :self.output_dim]
 
-        y = torch.add(torch.matmul(x, batched_fc1_w.permute(0, 2, 1)), batched_fc1_bias)
+        y = torch.matmul(x, batched_fc1_w.permute(0, 2, 1))
+        if self.batched_fc1_bias is not None:
+            y = torch.add(y, batched_fc1_bias)
         y = self.activation_fn(y)
-        y = torch.add(torch.matmul(y, batched_fc2_w), batched_fc2_bias)
+        y = torch.matmul(y, batched_fc2_w)
+        if self.batched_fc2_bias is not None:
+            y = torch.add(y, batched_fc2_bias)
         return y
 
 
